@@ -34,7 +34,7 @@ jobs:
         run: |
           pip install -U pip
           pip install torch transformers lightning_sdk
-          pip install pytest
+          pip install pytest pytest-benchmark
 
       - name: Run Coverage Trace Test
         env:
