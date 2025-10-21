@@ -1,5 +1,6 @@
 from functools import partial
 from contextlib import nullcontext
+import weakref
 
 import operator
 import sys
@@ -648,6 +649,9 @@ def test_nanogpt():
     assert_close(result, module(*args, **kwargs))
 
 
+# Note: When running with TF32 enabled on CUDA, the maximum absolute difference between outputs
+# can be on the order of 1e-3, which exceeds the default tolerances for torch.testing.assert_close.
+# This is expected due to the reduced precision of TF32 matrix multiplications.
 @skipif_not_pytorch_2_1
 @pytest.mark.parametrize(
     "name",
@@ -667,7 +671,7 @@ def test_nanogpt():
     "device",
     ("cpu", "cuda", "meta"),
 )
-def test_litgpt_variants(name, device):
+def test_litgpt_variants(name, device, turn_off_tf32_and_set_seed):
     from thunder.tests.litgpt_model import Config
     from litgpt.model import GPT
 
@@ -703,6 +707,9 @@ def test_litgpt_variants(name, device):
         torch.testing.assert_close(param1.grad, param2.grad, rtol=1e-2, atol=1e-2)
 
 
+# Note: When running with TF32 enabled on CUDA, the maximum absolute difference between outputs
+# can be on the order of 1e-3, which exceeds the default tolerances for torch.testing.assert_close.
+# This is expected due to the reduced precision of TF32 matrix multiplications.
 @skipif_not_pytorch_2_1
 @pytest.mark.parametrize(
     "name",
@@ -723,7 +730,7 @@ def test_litgpt_variants(name, device):
     "device",
     ("cpu", "cuda"),
 )
-def test_litgpt_variants_kvcache(name, device):
+def test_litgpt_variants_kvcache(name, device, turn_off_tf32_and_set_seed):
     from thunder.tests.litgpt_model import Config
     from litgpt.model import GPT
     import torch._dynamo  # this monkeypatches torch.manual_seed
@@ -1111,7 +1118,7 @@ def test_cache_symbolic_values_reshape():
     def foo(t, batch_size):
         return t.reshape(batch_size, -1).sum(-1)
 
-    jfoo = thunder_jit(foo, cache="symbolic values", nv_enable_bookend=False)
+    jfoo = thunder_jit(foo, cache="symbolic values")
     expected = foo(a, 32)
     actual = jfoo(a, 32)
 
@@ -1192,6 +1199,38 @@ def test_custom_autograd_function():
     out = jitted(x)
     out.backward(torch.rand_like(out))
     assert jitted.l1.weight.grad is not None
+
+
+@requiresCUDA
+def test_complex_backward_custom_autograd():
+    # This tests that backward tags are correctly propagated to the subsymbols of the custom autograd function.
+    # Without this propagation, operations for the backward pass could be fused with forward pass operations.
+    class CustomBackward(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            return x
+
+        @staticmethod
+        def backward(ctx, grad_at_output):
+            x = torch.randn_like(grad_at_output)
+            index = torch.randint(0, 1, (0, x.shape[-1]), device="cuda", dtype=torch.int64)
+            # the descent to scatter_add_'s subsymbols doesn't happen until _transform_for_operator_executor_execution
+            x.scatter_add_(index=index, src=grad_at_output, dim=-1)
+            return grad_at_output * x
+
+    def f(x):
+        y = CustomBackward.apply(x)
+        # the in-place op introduces a fusion break
+        x.add_(1)
+        z = x + x
+        return y, z
+
+    jf = thunder_jit(f, fusion_type="dataflow")
+
+    x = torch.ones(2, 3, device="cuda", requires_grad=True)
+
+    # This should not raise an error about variables referenced before assignment.
+    jf(x)
 
 
 @pytest.mark.filterwarnings("ignore:Please use torch.vmap")
@@ -1448,7 +1487,7 @@ def test_tag_static_memory_location():
 def test_args_order():
     @thunder_jit
     def fn(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10):
-        # do not skip functionalization process
+        # do not skip alias update process
         a9 += 1
         # do not drop arguments by dce
         return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10
@@ -1654,9 +1693,83 @@ def test_partial_method():
     ]
 
     for fn in test_cases:
-        import inspect
-
-        print("testing", inspect.getsource(fn))
         jfn = thunder.jit(fn)
         print(fn(), jfn())
         assert fn() == jfn()
+
+
+@requiresCUDA
+def test_jit_compile_data_cycle_leak():
+    memory_at_start = torch.cuda.memory_allocated()
+
+    def _allocate_model_in_function():
+        model = torch.nn.Linear(256, 256, device="cuda")
+
+        tfn = thunder.jit(model)
+        cd = tfn._lc_cd
+        return weakref.ref(cd), weakref.ref(model)
+
+    refs = _allocate_model_in_function()
+
+    assert torch.cuda.memory_allocated() == memory_at_start
+    for ref in refs:
+        assert ref() is None
+
+
+@requiresCUDA
+def test_jit_nn_module_cycle_leak():
+    def _allocate_and_call_model_in_function():
+        model = torch.nn.Linear(256, 256, device="cuda")
+
+        tfn = thunder.jit(model)
+        tfn(torch.randn(256, device="cuda"))
+        return weakref.ref(model)
+
+    # Warm-up run.
+    # If this test is run independently, then on the first run,
+    # PyTorch will allocate some memory for cuBlas, etc. So, we can't expect
+    # the memory to be the same before and after the first run.
+    ref = _allocate_and_call_model_in_function()
+    assert ref() is None
+
+    memory_start = torch.cuda.memory_allocated()
+    ref = _allocate_and_call_model_in_function()
+    assert ref() is None
+    assert torch.cuda.memory_allocated() == memory_start
+
+
+def test_dataclass_dict():
+    # diffusers model outputs are like this
+    from dataclasses import dataclass
+
+    @dataclass
+    class Foo(dict):
+        musthave: int
+
+    def fn():
+        return Foo(musthave=1)
+
+    assert fn() == thunder.jit(fn)()
+
+
+def test_replace_device():
+    from dataclasses import dataclass
+
+    @dataclass
+    class Foo(dict):
+        pass
+
+    class MyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.foo = Foo()
+
+        def forward(self, x):
+            self.foo.device = x.device
+            return 2 * x
+
+    jm = thunder.jit(MyModel())
+    a = torch.randn(2, 2)
+    jm(a)
+
+    assert isinstance(jm._model.foo.device, torch.device)

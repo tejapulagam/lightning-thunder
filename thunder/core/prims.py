@@ -257,7 +257,6 @@ class PrimIDs(Enum):
     TOPK = auto()
     # Sort and dim permutations prims
     SORT = auto()
-    ARGSORT = auto()
     # Scatter and gather prims (Experimental!)
     GATHER = auto()
     SCATTER = auto()
@@ -270,6 +269,7 @@ class PrimIDs(Enum):
     COPY_WITH_SETITEM = auto()
     # Linear algebra prims (Mostly experimental)
     MATMUL = auto()
+    _GROUPED_MM = auto()  # Used for grouped matmuls
     # NN prims (Experimental!)
     CONVOLUTION = auto()
     EMBEDDING = auto()
@@ -279,6 +279,7 @@ class PrimIDs(Enum):
     # Memory access methods
     ITEM = auto()
     COPY_ = auto()
+    BITCAST = auto()
     #
     SINK = auto()
 
@@ -300,10 +301,11 @@ class OpTags(Enum):
     AUTO_REGISTERED = auto()
     # Label for operations representing enter/exit of context managers.
     CTX_MANAGER_ENTER_EXIT_OP = auto()
-    # Label to explicitly disable an operation from recomputing in backward - see function `recompute_saved_for_backward`.
+    # Label to explicitly disable an operation from recomputing in backward.
     DONT_RECOMPUTE_IN_BACKWARD = auto()
     # Don't automatically tag operation to be recomputed in backward
     DONT_AUTO_RECOMPUTE_IN_BACKWARD = auto()
+    TORCH_COMPILE_COMPLIANT_CUSTOM_OP = auto()
 
 
 # TODO RC1 Document this function and describe the parts of a primitive
@@ -828,13 +830,13 @@ unpack_cache_info = make_prim(
 
 
 # TODO Restore const criteria
-def unpack_sequence_meta(x: Sequence | CollectionProxy, l: int, /) -> list:
+def unpack_sequence_meta(x: Sequence | CollectionProxy, length: int, /) -> list:
     if isinstance(x, CollectionProxy):
         x = x.collection()
 
     utils.check_type(x, Sequence)
-    utils.check_type(l, (int, IntegerProxy))
-    baseutils.check(len(x) == l, lambda x=x, l=l: f"Expected the length of {x=} to be {l=}")
+    utils.check_type(length, (int, IntegerProxy))
+    baseutils.check(len(x) == length, lambda x=x, length=length: f"Expected the length of {x=} to be {length=}")
 
     return list(_collectify(y) for y in x)
 
@@ -874,7 +876,7 @@ def unpack_sequence_printer(
     )
     utils.check_type(bsym.output, Sequence)
 
-    x, l = arg_printables
+    x, _ = arg_printables
     call_str = f"{codeutils.prettyprint(x)}"
 
     # Short-circuits if there's nothing to unpack:
@@ -892,7 +894,7 @@ def unpack_sequence_printer(
     return lines
 
 
-def unpack_sequence_impl(x: Sequence, l: int) -> list:
+def unpack_sequence_impl(x: Sequence) -> list:
     return list(x)
 
 
@@ -1203,8 +1205,8 @@ def pack_list_printer(
         exception_type=AssertionError,
     )
 
-    l = out_printables.name
-    call_str = f"{codeutils.prettyprint(l)}"
+    name = out_printables.name
+    call_str = f"{codeutils.prettyprint(name)}"
 
     parts = [f"{codeutils.prettyprint(arg, literals_as_underscores=True)}, " for arg in arg_printables]
     final_str = call_str.strip("'") + f" = [{''.join(parts)}]"
@@ -1648,7 +1650,7 @@ unpack_empty_dict = make_prim(
 
 
 def unpack_dict(d: dict | CollectionProxy) -> tuple[Any, ...]:
-    l = []
+    arr = []
 
     baseutils.check_type(d, (dict, CollectionProxy))
     if isinstance(d, CollectionProxy):
@@ -1663,9 +1665,9 @@ def unpack_dict(d: dict | CollectionProxy) -> tuple[Any, ...]:
 
     for k in keys:
         v = unpack_key(d, k)
-        l.append(v)
+        arr.append(v)
 
-    return tuple(l)
+    return tuple(arr)
 
 
 def unpack(x: Any) -> Any:
@@ -3371,9 +3373,9 @@ def pad_meta(a: TensorProxy, /, padding_value: Number, padding_config: Sequence[
     utils.check_same_dtype(a, padding_value)
 
     shape = []
-    for l, (lo, hi, dilation) in zip(a.shape, padding_config):
+    for length, (lo, hi, dilation) in zip(a.shape, padding_config):
         utils.check(dilation >= 0, lambda: f"Expected {dilation=} to be weakly positive")
-        final_length = l + max(0, l - 1) * dilation + lo + hi
+        final_length = length + max(0, length - 1) * dilation + lo + hi
         utils.check(final_length >= 0, lambda: f"The length of a dimension after padding would be {final_length=} < 0")
         shape.append(final_length)
 
@@ -3480,13 +3482,13 @@ def squeeze_meta(a: TensorProxy, /, dims: tuple[int, ...]) -> TensorProxy:
         )
 
     shape = []
-    for idx, l in enumerate(a.shape):
+    for idx, length in enumerate(a.shape):
         # Checks that squeezed dims have length one
         if idx in dims:
-            utils.check(l == 1, lambda: f"Cannot squeeze dimension {idx} of length {l} in a.shape={a.shape}")
+            utils.check(length == 1, lambda: f"Cannot squeeze dimension {idx} of length {length} in a.shape={a.shape}")
             continue
 
-        shape.append(l)
+        shape.append(length)
 
     return TensorProxy(like=a, shape=shape)
 
@@ -3508,8 +3510,8 @@ def take_meta(a: TensorProxy, /, index: TensorProxy, dim: int) -> TensorProxy:
         lambda: "Attempting to index a 0-length dimension {dim=} with a non-empty index",
     )
 
-    l = index.shape[0] if index.ndim == 1 else 1
-    new_shape = a.shape[:dim] + (l,) + a.shape[dim + 1 :]
+    length = index.shape[0] if index.ndim == 1 else 1
+    new_shape = a.shape[:dim] + (length,) + a.shape[dim + 1 :]
 
     return TensorProxy(like=a, shape=new_shape)
 
@@ -3632,7 +3634,7 @@ def gather_meta(a: TensorProxy, /, index: TensorProxy, dim: int) -> TensorProxy:
     )
     utils.validate_idx(a.ndim, dim)
 
-    for idx, l in enumerate(index.shape):
+    for idx, _ in enumerate(index.shape):
         if idx != dim:
             utils.check(
                 index.shape[idx] <= a.shape[idx],
@@ -3661,7 +3663,7 @@ def scatter_add_meta(a: TensorProxy, /, index: TensorProxy, value: TensorProxy, 
     )
     utils.validate_idx(a.ndim, dim)
 
-    for idx, l in enumerate(index.shape):
+    for idx, _ in enumerate(index.shape):
         if idx != dim:
             utils.check(
                 index.shape[idx] <= a.shape[idx],
@@ -3722,35 +3724,6 @@ def topk_meta(a: TensorProxy, /, k: int, dim: int, largest: Number, sorted: Numb
 topk = make_prim(PrimIDs.TOPK, "topk", meta=topk_meta, tags=(OpTags.REDUCTION_OP,))
 
 
-def argsort_meta(a: TensorProxy, /, dim: int, descending: Number, stable: Number) -> TensorProxy:
-    """Meta function for argsort primitive.
-
-    Args:
-        a: Input tensor
-        dim: Dimension along which to sort
-        descending: Sort in descending order if True
-        stable: Maintain relative order of equal elements if True
-
-    Returns:
-        TensorProxy with indices that would sort the tensor
-    """
-    # Validates types
-    utils.check_type(a, TensorProxy)
-    utils.check_type(dim, (int, IntegerProxy))
-    utils.check(pytype(descending) is bool, lambda: f"Expected {descending=} to be a boolean type")
-    utils.check(pytype(stable) is bool, lambda: f"Expected {stable=} to be a boolean type")
-
-    # Returns indices tensor with same shape as input but int64 dtype
-    return TensorProxy(like=a, dtype=dtypes.int64)
-
-
-argsort = make_prim(
-    PrimIDs.ARGSORT,
-    "argsort",
-    meta=argsort_meta,
-)
-
-
 def sort_meta(a: TensorProxy, /, dim: int, descending: Number, sorted: Number) -> (TensorProxy, TensorProxy):
     utils.check_type(a, TensorProxy)
     utils.check_type(dim, (int, IntegerProxy))
@@ -3761,6 +3734,62 @@ def sort_meta(a: TensorProxy, /, dim: int, descending: Number, sorted: Number) -
 
 
 sort = make_prim(PrimIDs.SORT, "sort", meta=sort_meta)
+
+
+def _grouped_mm_meta(a: TensorProxy, b: TensorProxy, offsets: TensorProxy) -> TensorProxy:
+    """Meta function for _grouped_mm primitive.
+
+    Accepts the following shape combinations:
+    1. (m, k) x (k, n) -> (groups, m, n)
+    2. (groups, m, k) x (k, n) -> (m, n)
+    3. (m, k) x (groups, k, n) -> (m, n)
+
+    Args:
+        a: Input tensor of shape (groups, m, k) or (m, k)
+        b: Input tensor of shape (groups, k, n) or (k, n)
+        offsets: Offset tensor of shape (groups,)
+
+    Returns:
+        TensorProxy with shape (groups, m, n) or (m, n)
+    """
+    # Validate types
+    utils.check_type(a, TensorProxy)
+    utils.check_type(b, TensorProxy)
+    utils.check_type(offsets, TensorProxy)
+
+    # Accept 2D or 3D tensors
+    utils.check(a.ndim in (2, 3), lambda: f"Expected a to have 2 or 3 dimensions, got {a.ndim}")
+    utils.check(b.ndim in (2, 3), lambda: f"Expected b to have 2 or 3 dimensions, got {b.ndim}")
+
+    utils.check(offsets.ndim == 1, lambda: f"`offsets` must be a vector, got shape {offsets.shape}")
+    if a.ndim == 2 and b.ndim == 2:
+        utils.check(a.shape[1] == b.shape[0], lambda: f"Inner dimension mismatch: {a.shape} vs {b.shape}")
+        out_shape = (offsets.shape[0], a.shape[0], b.shape[1])
+    if a.ndim == 3 and b.ndim == 2:
+        utils.check(a.shape[2] == b.shape[1], lambda: f"Inner dimension mismatch: {a.shape} vs {b.shape}")
+        utils.check(a.shape[0] == offsets.shape[0], lambda: f"Group count mismatch: {a.shape} vs {offsets.shape}")
+        out_shape = (a.shape[1], b.shape[1])
+    elif a.ndim == 2 and b.ndim == 3:
+        utils.check(a.shape[1] == b.shape[1], lambda: f"Inner dimension mismatch: {a.shape} vs {b.shape}")
+        utils.check(b.shape[0] == offsets.shape[0], lambda: f"Group count mismatch: {b.shape} vs {offsets.shape}")
+        out_shape = (a.shape[0], b.shape[2])
+    else:
+        utils.check(False, lambda: f"Unexpected shape combination: {a.shape} and {b.shape}")
+
+    utils.check_same_dtype(a, b)
+    utils.check(a.dtype in dtypes.float_math_dtypes, lambda: f"`a` must be 16-bit float or higher, got {a.dtype}")
+    utils.check(utils.is_integer_dtype(offsets.dtype), lambda: f"`offsets` must be integers, got {offsets.dtype}")
+
+    utils.check_same_device(a, b)
+
+    return TensorProxy(like=a, shape=out_shape)
+
+
+_grouped_mm = make_prim(
+    PrimIDs._GROUPED_MM,
+    "_grouped_mm",
+    meta=_grouped_mm_meta,
+)
 
 
 def transpose_meta(a: TensorProxy, /, permutation: tuple[int, ...]) -> TensorProxy:
@@ -4305,6 +4334,27 @@ def copy__meta(
 
 
 copy_ = make_prim(PrimIDs.COPY_, "copy_", meta=copy__meta, tags=(OpTags.DONT_DCE,))
+
+
+def bitcast_meta(
+    src: TensorProxy,
+    dtype: dtypes.dtype,
+) -> TensorProxy:
+    shape = list(src.shape)
+    src_itemsize = src.dtype.bytes
+    dst_itemsize = dtype.bytes
+    if src_itemsize != dst_itemsize:
+        factor = dst_itemsize / src_itemsize
+        if factor > 1:
+            utils.check(
+                shape[-1] > factor and shape[-1] % factor == 0,
+                lambda: f"{src.shape[-1]=} is not divisible by {factor=}. Viewing {src.dtype=} as {dtype=}",
+            )
+        shape[-1] = int(shape[-1] / factor)
+    return TensorProxy(shape=tuple(shape), device=src.device, dtype=dtype)
+
+
+bitcast = make_prim(PrimIDs.BITCAST, "bitcast", meta=bitcast_meta)
 
 
 def sink_meta(*args, **kwargs):

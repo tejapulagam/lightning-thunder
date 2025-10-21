@@ -1,6 +1,41 @@
+import importlib
+import importlib.util
+
 import pytest
 import pytest_benchmark
 from thunder.dynamo.compiler_graph_benchmark import GRAPH_BY_GRAPH_BENCHMARK_PARAMS_KEYS
+
+import torch
+
+nvfuser = None
+if importlib.util.find_spec("nvfuser_direct") is None and importlib.util.find_spec("nvfuser") is not None:
+    nvfuser = importlib.import_module("nvfuser")
+
+
+@pytest.fixture(autouse=True)
+def gpu_memory(request):
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        gpu_mem_before = torch.cuda.max_memory_allocated() / 2**30
+    yield
+    if torch.cuda.is_available():
+        gpu_mem = torch.cuda.max_memory_allocated() / 2**30
+        gpu_mem_limit = request.config.getoption("--gpu-mem-limit")
+        gpu_mem_use = gpu_mem - gpu_mem_before
+        if gpu_mem_limit:
+            assert gpu_mem_use <= gpu_mem_limit, (
+                f"test needs {gpu_mem - gpu_mem_before:.2f}GB VRAM, only {gpu_mem_limit:.2f}GB allowed"
+            )
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+
+@pytest.fixture(autouse=True)
+def test_cleanup(request):
+    yield
+    if nvfuser is not None:
+        nvfuser.FusionCache.reset()
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -40,3 +75,15 @@ def pytest_benchmark_group_stats(config, benchmarks, group_by):
 
 def pytest_collection_modifyitems(items):
     items.sort(key=lambda item: item.name)
+
+
+def pytest_addoption(parser):
+    parser.addoption("--gpu-mem-limit", type=float)
+
+
+@pytest.fixture
+def turn_off_tf32_and_set_seed(monkeypatch):
+    monkeypatch.setenv("NVIDIA_TF32_OVERRIDE", "0")
+    torch.manual_seed(42)
+    yield
+    torch.seed()

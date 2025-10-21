@@ -12,7 +12,6 @@ import sys
 import time
 import warnings
 from types import (
-    BuiltinFunctionType,
     BuiltinMethodType,
     CellType,
     FunctionType,
@@ -1121,6 +1120,29 @@ def _general_jit_torch_checkpoint_lookaside(
     return res
 
 
+@register_general_jit_lookaside(torch._ops.OpOverloadPacket.__call__)
+def _general_custom_op_def_call_lookaside(wrapped_opoverload_packet, *args, **kwargs):
+    from thunder.core.baseutils import check
+    from thunder.torch import _torch_to_thunder_function_map
+
+    opoverload_packet: torch._ops.OpOverloadPacket = unwrap(wrapped_opoverload_packet)
+    symbol: Symbol = _torch_to_thunder_function_map.get(opoverload_packet, None)
+    check(
+        symbol is not None,
+        lambda: (
+            f"{opoverload_packet} is not registered. Register its `custom_op` output with `thunder.torch.register_custom_op` "
+            f"`custom_op(name)(fn)` output, not `{opoverload_packet}` itself"
+        ),
+    )
+
+    u_args, u_kwargs = tree_map(unwrap, (args, kwargs))
+    output = symbol(*u_args, **u_kwargs)
+    return wrap(
+        output,
+        provenance=ProvenanceRecord(PseudoInst.LOOKASIDE, inputs=[wrapped_opoverload_packet.provenance]),
+    )
+
+
 # Adds proxy methods
 # NOTE These methods map to themselves, which prevents the interpreter from looking into them
 #   This is OK because these methods are written in a tracing-safe manner, and trying to
@@ -1820,11 +1842,11 @@ def unpack_inputs(ctx, prologue_trace, pro_to_comp_inps, pro_to_epi_inps, args, 
         return p
 
     with tracectx(prologue_trace):
-        for n, l in (("args", len(args)), ("kwargs", len(kwargs))):
+        for n, length in (("args", len(args)), ("kwargs", len(kwargs))):
             output = Proxy(name=n)
             bsym = prims.unpack_trivial.bind(output, output=output, name=n)
             prologue_trace.bound_symbols.append(bsym)
-            bsym = prims.check_len.bind(output, l, output=None)
+            bsym = prims.check_len.bind(output, length, output=None)
             prologue_trace.bound_symbols.append(bsym)
             if n == "args":
                 pro_args_proxy = output
@@ -1981,7 +2003,9 @@ def process_recorded_modifications(ctx, epilogue_trace):
                         setattr_obj_provenance = modified_object.provenance.inputs[0]
                         if hasattr(setattr_obj_provenance, "proxy"):
                             assert isinstance(
-                                value.value, (Proxy, int, float, tuple, NoneType)
+                                value.value, (Proxy, int, float, tuple, NoneType, thunder.devices.Device)
+                            ), (
+                                f"trying to set .{name} of {str(setattr_obj_provenance)}to object of type {type(value.value).__name__}"
                             )  # todo: better criterion
                             setattr_obj_proxy = setattr_obj_provenance.proxy
                             with tracectx(epilogue_trace):

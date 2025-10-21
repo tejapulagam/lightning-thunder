@@ -10,6 +10,7 @@ from collections.abc import Callable
 from collections.abc import Sequence
 from enum import Enum
 from functools import partial, reduce, wraps
+from looseversion import LooseVersion
 from numbers import Number
 from types import NoneType, ModuleType
 from typing import Any, overload
@@ -36,6 +37,7 @@ from thunder.core.proxies import (
     NumberLike,
     TensorProxy,
     FutureTensorProxy,
+    pytype,
     pyval,
     TupleProxy,
     ListProxy,
@@ -49,10 +51,12 @@ from thunder.core.transforms import register_grad, register_augmented_forward, r
 from thunder.core.prims import get_grad, put_grad
 import thunder
 from thunder.torch.default_torch_ops import _auto_registered_operators_returning_views
+from thunder.torch.custom_op import _register_custom_op
 
 
 __all__ = [
     "is_available",
+    "_register_custom_op",
 ]
 
 # NOTE torch is a requirement
@@ -850,7 +854,7 @@ def randint(
     utils.check(generator is None, lambda: "generator is not None which is currently unsupported", NotImplementedError)
     utils.check(out is None, lambda: "out is not None which is currently unsupported", NotImplementedError)
     device = to_device(maybe_get_default_device(device))
-    dtype = to_dtype(maybe_get_default_dtype(dtype))
+    dtype = to_dtype(dtype if dtype is not None else torch.int64)
 
     # dispatch our two overloads:
     if len(args) == 2 and isinstance(args[1], (tuple, list)):
@@ -1021,7 +1025,7 @@ def empty_like(
 
 
 # TODO Update this to take a *args series of tensors or a sequence of tensors
-@torchsymbol(torch.cat)
+@torchsymbol(torch.cat, torch.concat, torch.concatenate, id="torch.cat")
 def cat(tensors: Sequence[TensorLike], dim: int = 0) -> TensorLike:
     return clang.cat(tensors, dim)
 
@@ -1096,7 +1100,9 @@ def diagonal(a: TensorLike, /, offset: int = 0, dim1: int = 0, dim2: int = 1) ->
     return clang.diagonal(a, offset, dim1, dim2)
 
 
-@torchsymbol(torch.Tensor.expand, is_method=True)
+@torchsymbol(
+    torch.Tensor.expand, torch.broadcast_to, torch.Tensor.broadcast_to, id="torch.Tensor.expand", is_method=True
+)
 def expand(a: TensorLike, /, *shape: int) -> TensorLike:
     return clang.expand(a, *shape)
 
@@ -1138,7 +1144,7 @@ def setitem(inp, idx, val):
 
 @torchsymbol(torch.Tensor.__setitem__, id="setitem_", is_method=True, tags=(prims.OpTags.IN_PLACE,))
 def setitem_(inp, idx, val):
-    _copy_(inp, setitem(inp, idx, val))
+    return _copy_(inp, setitem(inp, idx, val))
 
 
 @torchsymbol(torch.Tensor.__getitem__, id="torch.Tensor.__getitem__", method_name="getitem")
@@ -1177,7 +1183,7 @@ def movedim(a: TensorLike, /, source: int | Sequence[int], destination: int | Se
     return clang.movedim(a, source, destination)
 
 
-@torchsymbol(torch.nn.functional.pad)
+@torchsymbol(torch.nn.functional.pad, torch._C._nn.pad, id="torch.nn.functional.pad")
 def pad(a: TensorProxy, /, pad: tuple[int, ...], mode: str | None = "constant", value: NumberLike | None = None):
     utils.check(mode == "constant", lambda: "Mode arguments other than constant are not supported")
     utils.check(len(pad) % 2 == 0, lambda: "Padding length must be divisible by 2")
@@ -1374,8 +1380,8 @@ def split(a: TensorProxy, size_or_sections: int | Sequence[int], /, dim=0) -> Te
     # NOTE: because split requires overspecifying the lengths, the final split is ignored
     cur = 0
     indices = []
-    for l in size_or_sections[: len(size_or_sections) - 1]:
-        cur += l
+    for length in size_or_sections[: len(size_or_sections) - 1]:
+        cur += length
         indices.append(cur)
 
     return _split_indices(a, indices, dim)
@@ -1394,8 +1400,8 @@ def squeeze(a: TensorLike, /, dim: None | int | Sequence[int] = None) -> TensorL
     dims = dim
     if dim is None:
         dims = []
-        for idx, l in enumerate(a.shape):
-            if l == 1:
+        for idx, length in enumerate(a.shape):
+            if length == 1:
                 dims.append(idx)
     elif isinstance(dim, (int, NumberProxy)):
         dims = (dim,)
@@ -1465,7 +1471,7 @@ def tensor_split(a: TensorLike, /, indices_or_sections, dim=0):
 def transpose(a: TensorLike, /, dim0: int, dim1: int) -> TensorLike:
     dim0, dim1 = utils.canonicalize_dims(a.ndim, (dim0, dim1))
 
-    permutation = list(range(0, a.ndim))
+    permutation = list(range(a.ndim))
     permutation[dim0] = dim1
     permutation[dim1] = dim0
     return clang.transpose(a, permutation)
@@ -1490,11 +1496,13 @@ def unsqueeze(a: TensorLike, /, dim: int) -> TensorLike:
     return clang.unsqueeze(a, dim)
 
 
-# TODO Review view functionalization
 # TODO Add type annotations
+# TODO(crcrpar): see [Return value of view creation ops]
 @torchsymbol(torch.Tensor.view, is_method=True)
 def view(a: TensorLike, /, *shape) -> TensorLike:
     shape = utils.extract_shape_from_varargs(shape)
+    if len(shape) == 1 and isinstance(shape[0], (torch.dtype, dtypes.dtype)):
+        return prims.bitcast(a, dtype=to_dtype(shape[0]))
     return reshape(a, shape)
 
 
@@ -1910,7 +1918,7 @@ def tan_(a):
     return _copy_(a, tan(a))
 
 
-@torchsymbol(torch.tanh, is_method=True)
+@torchsymbol(torch.tanh, torch.nn.functional.tanh, id="torch.tanh", is_method=True)
 def tanh(a):
     return clang.tanh(a)
 
@@ -2246,6 +2254,25 @@ def threshold_(a: TensorProxy, /, threshold: float, value: float) -> TensorLike:
 _inplace_to_out_of_place[threshold_] = threshold, -1
 
 
+@torchsymbol(torch.square, is_method=True)
+def square(a):
+    if isinstance(dtypes.to_dtype(a), dtypes.bool_):
+        a = clang.maybe_convert_to_dtype(a, dtypes.int64)
+    return a * a
+
+
+@torchsymbol(torch.square_, is_method=True, tags=(prims.OpTags.IN_PLACE,))
+def square_(a):
+    utils.check(
+        not isinstance(dtypes.to_dtype(a), dtypes.bool_),
+        lambda: f"Result type of {dtypes.int64} cannot be stored into {dtypes.to_dtype(a)}",
+    )
+    return _copy_(a, square(a))
+
+
+_inplace_to_out_of_place[square_] = square, -1
+
+
 #
 # Elementwise binary operations
 #
@@ -2352,7 +2379,7 @@ def div_(
     *,
     rounding_mode: None | str = None,
 ) -> TensorLike:
-    return _copy_(a, div(a, b))
+    return _copy_(a, div(a, b, rounding_mode=rounding_mode))
 
 
 @torchsymbol(torch.eq, torch.Tensor.__eq__, is_method=True)
@@ -3212,7 +3239,7 @@ def repeat_interleave(
     if output_size is not None:
         raise NotImplementedError("thunder.torch.repeat_interleave does not support dim argument yet")
     if isinstance(repeats, TensorProxy):
-        raise NotImplementedErrror("thunder.torch.repeat_interleave does not support tensor repeats yet")
+        raise NotImplementedError("thunder.torch.repeat_interleave does not support tensor repeats yet")
     if dim is None:
         return input.reshape((-1, 1)).expand(-1, repeats).reshape(-1)
 
@@ -3367,7 +3394,7 @@ def sort(
     return clang.sort(a, dim, descending, stable)
 
 
-@torchsymbol(torch.argsort, is_method=True)
+@torchsymbol(torch.argsort, is_method=True, is_prim=True)
 def argsort(a: TensorLike, /, dim: None | int = -1, descending: bool = False, stable: bool = False) -> TensorLike:
     """Returns the indices that would sort an array along the given dimension.
 
@@ -3380,7 +3407,18 @@ def argsort(a: TensorLike, /, dim: None | int = -1, descending: bool = False, st
     Returns:
         Tensor of indices that would sort the array
     """
-    return clang.argsort(a, dim, descending, stable)
+    if dim is None:
+        dim = a.ndim - 1 if a.ndim > 0 else 0
+    dim = utils.canonicalize_dim(a.ndim, dim)
+
+    # Validates types
+    utils.check_type(a, TensorProxy)
+    utils.check_type(dim, (int, IntegerProxy))
+    utils.check(pytype(descending) is bool, lambda: f"Expected {descending=} to be a boolean type")
+    utils.check(pytype(stable) is bool, lambda: f"Expected {stable=} to be a boolean type")
+
+    # Returns indices tensor with same shape as input but int64 dtype
+    return TensorProxy(like=a, dtype=dtypes.int64)
 
 
 #
@@ -3582,8 +3620,8 @@ def einsum(equation: str, *operands: TensorLike | Sequence[TensorLike]) -> Tenso
             return self
 
         def __next__(self):
-            l, d = next(self.eq_iter)
-            if l == ".":
+            label, d = next(self.eq_iter)
+            if label == ".":
                 utils.check(
                     not self.seen_ellipsis,
                     lambda: f"Incorrect subscript for operand #{self.pos}: it contains two or more ellipses",
@@ -3598,7 +3636,7 @@ def einsum(equation: str, *operands: TensorLike | Sequence[TensorLike]) -> Tenso
             # This variable has meaning only if ellipsis is present.
             self.ellipsis_end = d - 1
 
-            return l, d
+            return label, d
 
     # Returns a label -> list of dims positions map.
     # If Ellipsis is in the map,
@@ -3609,18 +3647,18 @@ def einsum(equation: str, *operands: TensorLike | Sequence[TensorLike]) -> Tenso
         n_subscripted_dims = 0
         label_dims_map = {}
         label_dim_iter = LabelDimIter(pos, subscript)
-        for l, d in label_dim_iter:
+        for label, d in label_dim_iter:
             # Skip ellipsis
-            if l == ".":
+            if label == ".":
                 continue
 
             n_subscripted_dims = n_subscripted_dims + 1
-            dims = label_dims_map.setdefault(l, [])
+            dims = label_dims_map.setdefault(label, [])
             if dims:
                 utils.check(
                     operand is None or operand.shape[d] == operand.shape[dims[-1]],
                     lambda: f"Incorrect subscript for operand #{pos}: "
-                    f"repeated label '{l}' requires dimensions "
+                    f"repeated label '{label}' requires dimensions "
                     f"{d} and {dims[-1]} to have the same lenght, "
                     f"but got {operand.shape[d]} != {operand.shape[dims[-1]]}",
                     ValueError,
@@ -3662,22 +3700,22 @@ def einsum(equation: str, *operands: TensorLike | Sequence[TensorLike]) -> Tenso
 
     # NOTE: the checks below are must since opt_einsum is not doing them. {
     operand_union_subscript_spec = collections.ChainMap(*operand_subscript_specs)
-    for l, dims in out_spec.items():
+    for label, dims in out_spec.items():
         # Skip ellipsis.
-        if l is Ellipsis:
+        if label is Ellipsis:
             continue
 
         # check uniqueness.
         utils.check(
             len(dims) == 1,
-            lambda: f"Output subscript string '{output_subscript}' includes multiple '{l}' labels",
+            lambda: f"Output subscript string '{output_subscript}' includes multiple '{label}' labels",
             ValueError,
         )
 
         # check output labels are coming from operand's subscripts.
         utils.check(
-            l in operand_union_subscript_spec,
-            lambda: f"Output subscript string '{output_subscript}' includes a '{l}' label "
+            label in operand_union_subscript_spec,
+            lambda: f"Output subscript string '{output_subscript}' includes a '{label}' label "
             "which does not apper in neither of the operand's subsripts",
             ValueError,
         )
@@ -3740,7 +3778,7 @@ def einsum(equation: str, *operands: TensorLike | Sequence[TensorLike]) -> Tenso
         for label, count in counts.items():
             # Process only repeated labels.
             if count > 1:
-                label_dims = [d for d, l in enumerate(orig_labels) if l == label]
+                label_dims = [d for d, label_orig in enumerate(orig_labels) if label_orig == label]
                 label_dim_len = operand.shape[label_dims[0]]
                 diag_groups.setdefault(label_dim_len, []).extend(label_dims)
                 if label not in keep_labels:
@@ -3763,8 +3801,8 @@ def einsum(equation: str, *operands: TensorLike | Sequence[TensorLike]) -> Tenso
 
     def find_broadcast_labels(a, a_labels, b, b_labels):
         common_contraction_set = frozenset(a_labels) & frozenset(b_labels) & contraction_set
-        a_contr_dims = [a_labels.index(l) for l in common_contraction_set]
-        b_contr_dims = [b_labels.index(l) for l in common_contraction_set]
+        a_contr_dims = [a_labels.index(label) for label in common_contraction_set]
+        b_contr_dims = [b_labels.index(label) for label in common_contraction_set]
 
         a_broadcast_dims = []
         a_broadcast_labels = []
@@ -3794,7 +3832,7 @@ def einsum(equation: str, *operands: TensorLike | Sequence[TensorLike]) -> Tenso
             counts = collections.Counter(labels)
 
             # Find unique contraction indices.
-            unique_labels = [l for l in contraction_set if counts[l] == 1]
+            unique_labels = [label for label in contraction_set if counts[label] == 1]
             unique_contr_dims, unique_contr_labels = find_unique_labels(operand, labels, unique_labels)
 
             # Find repeated indices over "diagonalized" operand.
@@ -3817,8 +3855,8 @@ def einsum(equation: str, *operands: TensorLike | Sequence[TensorLike]) -> Tenso
             a_counts = collections.Counter(a_labels)
             b_counts = collections.Counter(b_labels)
 
-            a_unique_labels = [l for l in contraction_set if a_counts[l] == 1 and b_counts[l] == 0]
-            b_unique_labels = [l for l in contraction_set if b_counts[l] == 1 and a_counts[l] == 0]
+            a_unique_labels = [label for label in contraction_set if a_counts[label] == 1 and b_counts[label] == 0]
+            b_unique_labels = [label for label in contraction_set if b_counts[label] == 1 and a_counts[label] == 0]
 
             # Find unique to each operand dims/labels
             a_unique_contr_dims, a_unique_contr_labels = find_unique_labels(a, a_labels, a_unique_labels)
@@ -4078,9 +4116,9 @@ def _matrix_chain_order(a: Sequence[TensorLike], /) -> TensorLike:
     p.append(a[n - 1].size(1))
     m = torch.zeros(n, n, dtype=torch.int64)
     s = torch.zeros(n, n, dtype=torch.int64)
-    for l in range(1, n):
-        for i in range(n - l):
-            j = i + l
+    for chain_len in range(1, n):
+        for i in range(n - chain_len):
+            j = i + chain_len
             m[i][j] = torch.iinfo(torch.int64).max
             for k in range(i, j):
                 q = m[i][k] + m[k + 1][j] + p[i] * p[k + 1] * p[j + 1]
@@ -4384,15 +4422,9 @@ def _native_batch_norm(
 
     # Handles weight and bias
     if weight is not None:
-        # Inserting a conversion to the computation_dtype for weight and bias to
-        # disable nvFuser executors's bookend optimization (nv_enable_bookend),
-        # preventing the executor to push out the shape operations out of the
-        # fusion region.
-        weight = to(weight, computation_dtype)
         weight = reshape(weight, params_shape)
         out = out * weight
     if bias is not None:
-        bias = to(bias, computation_dtype)
         bias = reshape(bias, params_shape)
         out = out + bias
 
@@ -5125,10 +5157,10 @@ def cross_entropy(
             output_shape = list(a.shape)
             output_shape.pop(class_dim)
             return full(output_shape, 0.0, device=a.device, dtype=a.dtype)
-        elif reduction == "sum":
-            return full(result_shape := [], fill_value := 0.0, device=a.device, dtype=a.dtype)
-        elif reduction == "mean":
-            return full(result_shape := [], fill_value := float("nan"), device=a.device, dtype=a.dtype)
+        if reduction == "sum":
+            return full([], fill_value=0.0, device=a.device, dtype=a.dtype)
+        if reduction == "mean":
+            return full([], fill_value=float("nan"), device=a.device, dtype=a.dtype)
 
     if a.shape == target.shape:
         return _cross_entropy_loss_probability_target(a, target, weight, ignore_index, reduction, label_smoothing)
@@ -5443,9 +5475,9 @@ def _interpolate_scale_factor_helper(
     scale_factor: Sequence[float] | float,
     mode: str = "nearest",
 ) -> TensorLike:
-    if mode not in ("nearest", "nearest-exact"):
+    if mode not in ("nearest", "nearest-exact", "bilinear"):
         raise ValueError(
-            f"_interpolate_scale_factor_helper expected mode to be 'nearest' or 'nearest-exact', but got {mode}"
+            f"_interpolate_scale_factor_helper expected mode to be 'nearest', 'nearest-exact' or 'bilinear', but got {mode}"
         )
 
     # a is assumed to be at least 3D.
@@ -5466,66 +5498,119 @@ def _interpolate_scale_factor_helper(
             f"a sequence of strictly positive floating point numbers of length {dim}",
         )
 
-    # perform nearest up/down-sampling
-    def nearest_sampler(
-        t: TensorLike,
-        input_dim: int,
-        output_dim: int,
-        *,
-        scale: float,
-        dim: int,
-        exact: bool,
-    ) -> TensorLike:
-        # It is expected that output_dim = int(input_dim * scale).
-        # Indices [0, ..., output_dim - 1] are mapped to [0, ..., input_dim - 1]
-        # with the rule i -> int(i * scale) or i -> round((i + 0.5) * scale - 0.5),
-        # corresponding to modes 'nearest' or 'nearest-exact', respectively.
-        # Values at these indices is the result.
-        # References https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/UpSample.h
-        selected_idx = arange(0, output_dim, device=a.device)
-        selected_idx = to((selected_idx + exact * 0.5) * scale, selected_idx.dtype)
-        return clang.take(t, selected_idx, dim=dim)
+    if mode == "bilinear":
 
-    def dim_expander(t, dim, n_repeats):
-        t = unsqueeze(t, dim + 1)
-        t = expand(t, t.shape[: dim + 1] + (n_repeats,) + t.shape[dim + 2 :])
-        return t
+        def _bilinear_sampler_2d(
+            t: TensorLike,
+            in_h: int,
+            in_w: int,
+            out_h: int,
+            out_w: int,
+            *,
+            dim_h: int = 2,
+            dim_w: int = 3,
+            math_dtype: torch.dtype = torch.float32,
+        ) -> TensorLike:
+            # The X pass
+            x_dst = arange(out_w, device=t.device).to(math_dtype)
+            scale_w = to(in_w / out_w, math_dtype)
+            # The 0.5s come from the fact that we treat each element as a pixel,
+            # that has its centerpoint at x0 + 0.5. With the formula below we
+            # make sure that the centerpoints of these "images" align, because align_corners
+            # is not yet implemented
+            x_src_f = to((x_dst + 0.5) * scale_w - 0.5, math_dtype)
+            x0 = clamp(clang.floor(x_src_f), 0, in_w - 1).to(to_dtype(torch.int64))
+            x1 = clamp(clang.ceil(x_src_f), 0, in_w - 1).to(to_dtype(torch.int64))
+            wx = unsqueeze(unsqueeze((x_src_f - x0.to(x_src_f.dtype)), 0), 0)
 
-    res_output_spatial_dims = []
+            v0 = clang.take(t, x0, dim=dim_w)
+            v1 = clang.take(t, x1, dim=dim_w)
+            # Linear interpolation in the width-direction
+            t_x = v0 * (1 - wx) + v1 * wx
 
-    for k, (scale, input_dim) in enumerate(zip(reversed(scale_factor), reversed(spatial_dims))):
-        output_dim = int(scale * input_dim)
+            # The Y pass
+            y_dst = arange(out_h, device=t.device).to(math_dtype)
+            scale_h = to(in_h / out_h, math_dtype)
+            y_src_f = to((y_dst + 0.5) * scale_h - 0.5, math_dtype)
+            y0 = clamp(clang.floor(y_src_f), 0, in_h - 1).to(to_dtype(torch.int64))
+            y1 = clamp(clang.ceil(y_src_f), 0, in_h - 1).to(to_dtype(torch.int64))
+            wy = unsqueeze(unsqueeze(unsqueeze((y_src_f - y0.to(y_src_f.dtype)), 0), 0), -1)
+
+            v0 = clang.take(t_x, y0, dim=dim_h)
+            v1 = clang.take(t_x, y1, dim=dim_h)
+            result = v0 * (1 - wy) + v1 * wy
+            return to(result, a.dtype)
+
         utils.check(
-            output_dim > 0,
-            lambda: f"provided scale_factor value {scale} results in a zero length output at dimension {k + 2}",
+            len(spatial_dims) == 2,
+            lambda: f"bilinear interpolation supports exactly two spatial dims, got {len(spatial_dims)}",
         )
-        res_output_spatial_dims.append(output_dim)
+        in_h, in_w = spatial_dims
+        out_h = int(in_h * scale_factor[0])
+        out_w = int(in_w * scale_factor[1])
+        utils.check(out_h > 0 and out_w > 0, lambda: f"scale_factor leads to zero-size output ({out_h}x{out_w})")
+        return _bilinear_sampler_2d(a, in_h, in_w, out_h, out_w, math_dtype=utils.get_computation_dtype(a.dtype))
+    elif mode == "nearest" or mode == "nearest-exact":
+        # perform nearest up/down-sampling
+        def nearest_sampler(
+            t: TensorLike,
+            input_dim: int,
+            output_dim: int,
+            *,
+            scale: float,
+            dim: int,
+            exact: bool,
+        ) -> TensorLike:
+            # It is expected that output_dim = int(input_dim * scale).
+            # Indices [0, ..., output_dim - 1] are mapped to [0, ..., input_dim - 1]
+            # with the rule i -> int(i * scale) or i -> round((i + 0.5) * scale - 0.5),
+            # corresponding to modes 'nearest' or 'nearest-exact', respectively.
+            # Values at these indices is the result.
+            # References https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/UpSample.h
+            selected_idx = arange(0, output_dim, device=a.device)
+            selected_idx = to((selected_idx + exact * 0.5) * scale, selected_idx.dtype)
+            return clang.take(t, selected_idx, dim=dim)
 
-        # k iterates from the end, and we skip the first 2
-        # dimenions corresponding to batches and channels.
-        curr_dim = 2 + (len(spatial_dims) - k - 1)
+        def dim_expander(t, dim, n_repeats):
+            t = unsqueeze(t, dim + 1)
+            t = expand(t, t.shape[: dim + 1] + (n_repeats,) + t.shape[dim + 2 :])
+            return t
 
-        exact: bool = mode == "nearest-exact"
-        if output_dim <= input_dim:
-            if output_dim <= input_dim // 2:
-                # scale_factor <= 1 (i.e. output_dim <= input_dim) implies simple slice
-                # when output_dim <= input_dim // 2.
-                stride = input_dim // output_dim
-                end = input_dim - (input_dim % output_dim)
-                a = clang.slice_in_dim(a, 0, end, stride=stride, dim=curr_dim)
+        res_output_spatial_dims = []
+
+        for k, (scale, input_dim) in enumerate(zip(reversed(scale_factor), reversed(spatial_dims))):
+            output_dim = int(scale * input_dim)
+            utils.check(
+                output_dim > 0,
+                lambda: f"provided scale_factor value {scale} results in a zero length output at dimension {k + 2}",
+            )
+            res_output_spatial_dims.append(output_dim)
+
+            # k iterates from the end, and we skip the first 2
+            # dimenions corresponding to batches and channels.
+            curr_dim = 2 + (len(spatial_dims) - k - 1)
+
+            exact: bool = mode == "nearest-exact"
+            if output_dim <= input_dim:
+                if output_dim <= input_dim // 2:
+                    # scale_factor <= 1 (i.e. output_dim <= input_dim) implies simple slice
+                    # when output_dim <= input_dim // 2.
+                    stride = input_dim // output_dim
+                    end = input_dim - (input_dim % output_dim)
+                    a = clang.slice_in_dim(a, 0, end, stride=stride, dim=curr_dim)
+                else:
+                    # In this case slice will not do and explicit downsample is needed.
+                    a = nearest_sampler(a, input_dim, output_dim, scale=1.0 / scale, dim=curr_dim, exact=exact)
             else:
-                # In this case slice will not do and explicit downsample is needed.
-                a = nearest_sampler(a, input_dim, output_dim, scale=1.0 / scale, dim=curr_dim, exact=exact)
-        else:
-            if output_dim % input_dim == 0:
-                # In this case we can just expand dim.
-                n_repeats = output_dim // input_dim
-                a = dim_expander(a, curr_dim, n_repeats)
-            else:
-                # In this case expand will not cut it and explicit upsampling is needed.
-                a = nearest_sampler(a, input_dim, output_dim, scale=1.0 / scale, dim=curr_dim, exact=exact)
+                if output_dim % input_dim == 0:
+                    # In this case we can just expand dim.
+                    n_repeats = output_dim // input_dim
+                    a = dim_expander(a, curr_dim, n_repeats)
+                else:
+                    # In this case expand will not cut it and explicit upsampling is needed.
+                    a = nearest_sampler(a, input_dim, output_dim, scale=1.0 / scale, dim=curr_dim, exact=exact)
 
-    output_shape = [batch, channels] + res_output_spatial_dims[::-1]
+        output_shape = [batch, channels] + res_output_spatial_dims[::-1]
     return reshape(a, output_shape)
 
 
@@ -5569,15 +5654,15 @@ def interpolate(
     antialias: bool = False,
 ) -> TensorLike:
     utils.check(
-        (mode == "nearest" or mode == "nearest-exact"),
-        lambda: f"only modes 'nearest' and 'nearest-exact' are supported at the moment, but got {mode=}",
+        (mode == "nearest" or mode == "nearest-exact" or mode == "bilinear"),
+        lambda: f"only modes 'nearest', 'nearest-exact' and 'bilinear' are supported at the moment, but got {mode=}",
         exception_type=NotImplementedError,
     )
 
     utils.check(a.ndim >= 3, lambda: f"Expected {a.ndim=} >= 3")
     utils.check(a.numel() > 0, lambda: f"Expected {a.numel=} to be greater than 0")
     utils.check(
-        align_corners == None,
+        align_corners is None,
         lambda: "Thunder does not yet support 'align_corners'.",
         exception_type=NotImplementedError,
     )
@@ -5616,6 +5701,25 @@ register_grad(item.id, item)
 @torchsymbol(torch.nn.functional.linear)
 def linear(a: TensorLike, w: TensorLike, /, bias: None | TensorLike = None) -> TensorLike:
     return prims.linear(a, w, bias)
+
+
+if LooseVersion(torch.__version__) >= "2.8":
+
+    @torchsymbol(torch._grouped_mm)
+    def _grouped_mm(
+        a: TensorProxy,
+        b: TensorProxy,
+        offsets: None | TensorProxy = None,
+        bias: None | TensorProxy = None,
+        dtype: None | dtypeLike = None,
+    ) -> TensorProxy:
+        utils.check(offsets is not None, lambda: "Current implementation requires `offsets`.")
+        utils.check(bias is None, lambda: "Current implementation doesn't support `bias`.")
+        utils.check(
+            dtype in (None, a.dtype),
+            lambda: f"Current implementation requires `dtype` to be None or the same as `a`. Got: {dtype} vs {a.dtype}",
+        )
+        return prims._grouped_mm(a, b, offsets)
 
 
 @torchsymbol(torch.logsumexp, is_method=True)
@@ -5681,11 +5785,11 @@ def _nll_loss_helper(
         if reduction == "none":
             # Keep target shape if it is non-trivial
             result_shape = target.shape if target.shape != (0,) else []
-            return full(result_shape, fill_value := 0.0, device=a.device, dtype=a.dtype), None
+            return full(result_shape, fill_value=0.0, device=a.device, dtype=a.dtype), None
         elif reduction == "sum":
-            return full(result_shape := [], fill_value := 0.0, device=a.device, dtype=a.dtype), None
+            return full(shape=[], fill_value=0.0, device=a.device, dtype=a.dtype), None
         elif reduction == "mean":
-            return full(result_shape := [], fill_value := float("nan"), device=a.device, dtype=a.dtype), None
+            return full(shape=[], fill_value=float("nan"), device=a.device, dtype=a.dtype), None
 
     utils.check(
         utils.is_integer_dtype(target.dtype),
@@ -6593,7 +6697,7 @@ def _get_fake_arg(inp: Any):
             raise NotImplementedError("Unsupported for NumberProxy.value=None")
         else:
             return inp.value
-    elif isinstance(inp, TensorProxy):
+    elif isinstance(inp, (TensorProxy, torch.Tensor)):
         return torch.empty(
             inp.shape,
             dtype=to_torch_dtype(inp.dtype),
@@ -6756,7 +6860,6 @@ _torch_to_thunder_complete_map = {
 # records the torch symbols that may return tensor views
 # ref: https://pytorch.org/docs/stable/tensor_view.html
 # NOTE Symbols that return tensor views can interfere with in-place operators
-# See :func:`thunder.core.functionalization.check_inplace_to_views` for the details.
 _syms_that_may_return_views: set[Symbol] = {
     reshape,
     contiguous,
@@ -6765,6 +6868,11 @@ _syms_that_may_return_views: set[Symbol] = {
     _torch_to_thunder_function_map[torch.Tensor.reshape_as],
 }
 
+# TODO(crcrpar): [Return value of view creation ops]
+# Review what's more appropriate return value from the ops below.
+# Currently they return a new tensor, which obscures the nature of these ops, i.e.,
+# outputs share underlying storage with inputs. For more stable and improved in-place support
+# it'd be necessary to think about e.g. extending TensorProxy and/or DCE.
 _syms_returning_views: set[Symbol] = {
     diagonal,
     expand,

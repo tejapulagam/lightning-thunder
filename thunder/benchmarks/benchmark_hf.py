@@ -13,8 +13,6 @@ from torch.profiler import profile, record_function, ProfilerActivity
 class DebugRecipe(BaseRecipe):
     def setup_config(self):
         config = super().setup_config()
-        config["skip_inplace_functionalization"] = False
-        config["skip_alias_functionalization"] = True
         return config
 
 
@@ -37,13 +35,13 @@ recipes = [nvfuser_recipe, torchcompile_recipe]
 
 def run_and_profile(tag: str, fn, model, inp, compiled_models: dict[str, torch.nn.Module], cache=None):
     print(f"[{tag}] running PyTorch eager")
-    eager_time = benchmark_n(10, fn, model, inp)
+    eager_time = benchmark_n(10, fn, model, inp, device=device)
 
     timings = [f"Eager: {eager_time:.2f}ms"]
 
     for name, compiled_model in compiled_models.items():
         print(f"[{tag}] running Thunder ({name})")
-        thunder_time = benchmark_n(10, fn, compiled_model, inp, cache=cache)
+        thunder_time = benchmark_n(10, fn, compiled_model, inp, cache=cache, device=device)
         timings.append(f"Thunder ({name}): {thunder_time:.2f}ms")
 
         if save_traces:
